@@ -1,0 +1,179 @@
+name: Build and deploy the libsignal-verify blueprint book
+
+# Run by hand: Actions -> this workflow -> Run workflow. Nothing triggers it. The book is built from
+# the commit of libsignal-verify named in LIBSIGNAL_VERIFY_REF, or from the `ref` input when given.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit, branch or tag of libsignal-verify to build (default is the content of LIBSIGNAL_VERIFY_REF)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      LEAN_NUM_THREADS: '2'
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Choose the commit of libsignal-verify to build
+        id: ref
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${INPUT_REF:-}"
+          if [[ -z "$ref" ]]; then
+            ref="$(head -n 1 LIBSIGNAL_VERIFY_REF | tr -d '[:space:]')"
+          fi
+          [[ "$ref" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "Not a valid ref: '$ref'" >&2; exit 1; }
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Check out libsignal-verify
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: Beneficial-AI-Foundation/libsignal-verify
+          ref: ${{ steps.ref.outputs.ref }}
+          path: libsignal-verify
+          persist-credentials: false
+
+      - name: Record the commit that the source links will name
+        id: commit
+        working-directory: libsignal-verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          for file in vb-docs/lakefile.lean vb-docs/scripts/export-public.py; do
+            [[ -f "$file" ]] || {
+              echo "::error::Commit $commit has no $file. Set LIBSIGNAL_VERIFY_REF (or the ref input) to a commit that contains the book and its publication script."
+              exit 1
+            }
+          done
+          # The renderer reads this file; it must exist before the book is rendered.
+          printf '%s\n' "$commit" > vb-docs/source-revision
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Reserve disk space on the disposable hosted runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_ACTIONS:-}" == true && "${RUNNER_ENVIRONMENT:-}" == github-hosted ]] || {
+            echo 'Refusing SDK cleanup outside a disposable GitHub-hosted runner.' >&2
+            exit 1
+          }
+          available_kib() { df --output=avail -k "$GITHUB_WORKSPACE" | tail -n 1 | tr -d ' '; }
+          required_kib=$((24 * 1024 * 1024))
+          df -h "$GITHUB_WORKSPACE"
+          # Fixed image-owned SDK paths only. This Lean build uses neither SDK.
+          if (( $(available_kib) < required_kib )) && [[ -d /usr/local/lib/android/sdk ]]; then
+            [[ "$(realpath -e /usr/local/lib/android/sdk)" == /usr/local/lib/android/sdk ]]
+            [[ -d /usr/local/lib/android/sdk/platform-tools ]]
+            sudo rm -rf -- /usr/local/lib/android/sdk
+          fi
+          if (( $(available_kib) < required_kib )) && [[ -d /usr/share/dotnet ]]; then
+            [[ "$(realpath -e /usr/share/dotnet)" == /usr/share/dotnet ]]
+            [[ -x /usr/share/dotnet/dotnet && -d /usr/share/dotnet/sdk ]]
+            sudo rm -rf -- /usr/share/dotnet
+          fi
+          df -h "$GITHUB_WORKSPACE"
+          (( $(available_kib) >= required_kib )) || {
+            echo 'The Lean build requires at least 24 GiB free before toolchain installation.' >&2
+            exit 1
+          }
+
+      - name: Install the pinned Lean toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/elan.tar.gz"
+          curl --fail --location --retry 3 \
+            https://github.com/leanprover/elan/releases/download/v4.2.4/elan-x86_64-unknown-linux-gnu.tar.gz \
+            --output "$archive"
+          echo "42b94d4244e8353142c456ec0e4ca6528fd898a6c604d4059f494e706e431f63  $archive" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/elan-installer"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/elan-installer"
+          "$RUNNER_TEMP/elan-installer/elan-init" -y --default-toolchain none --no-modify-path
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.elan/bin:$PATH"
+          # The root package and the book pin the same toolchain; install each one named.
+          awk 'NF' libsignal-verify/lean-toolchain libsignal-verify/vb-docs/lean-toolchain | sort -u |
+            while read -r toolchain; do elan toolchain install "$toolchain"; done
+
+      - name: Restore the compiled packages
+        id: lean-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        continue-on-error: true # An optimisation only: every build step still runs.
+        with:
+          path: |
+            libsignal-verify/.lake
+            libsignal-verify/vb-docs/.lake
+          key: book-${{ runner.os }}-${{ hashFiles('libsignal-verify/lean-toolchain', 'libsignal-verify/lake-manifest.json', 'libsignal-verify/vb-docs/lake-manifest.json', 'libsignal-verify/vb-docs/lakefile.lean') }}-${{ steps.commit.outputs.commit }}
+          restore-keys: |
+            book-${{ runner.os }}-${{ hashFiles('libsignal-verify/lean-toolchain', 'libsignal-verify/lake-manifest.json', 'libsignal-verify/vb-docs/lake-manifest.json', 'libsignal-verify/vb-docs/lakefile.lean') }}-
+
+      - name: Fetch the Mathlib cache
+        working-directory: libsignal-verify/vb-docs
+        run: lake exe cache get
+
+      - name: Compile the book and the Lean it describes
+        working-directory: libsignal-verify/vb-docs
+        run: |
+          df -h .
+          lake build LibsignalVerifyBlueprint
+          df -h .
+
+      - name: Save the compiled packages before rendering
+        if: steps.lean-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        continue-on-error: true
+        with:
+          path: |
+            libsignal-verify/.lake
+            libsignal-verify/vb-docs/.lake
+          key: ${{ steps.lean-cache.outputs.cache-primary-key }}
+
+      - name: Render the book
+        working-directory: libsignal-verify/vb-docs
+        run: lake exe vbp build
+
+      - name: Export the site without local paths
+        env:
+          COMMIT: ${{ steps.commit.outputs.commit }}
+        run: |
+          python3 libsignal-verify/vb-docs/scripts/export-public.py \
+            --source-revision "$COMMIT" --destination "$GITHUB_WORKSPACE/_site"
+
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
